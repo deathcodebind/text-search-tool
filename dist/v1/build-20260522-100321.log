@@ -1,0 +1,12 @@
++ cargo tauri build
+        Info Looking up installed tauri packages to check mismatched versions...
+   Compiling app v0.1.0 (/Users/huyingjie/dev/rust-demos/text-search-tool/src-tauri)
+    Finished `release` profile [optimized] target(s) in 15.99s
+       Built application at: /Users/huyingjie/dev/rust-demos/text-search-tool/target/release/app
+    Bundling Text Search Tool.app (/Users/huyingjie/dev/rust-demos/text-search-tool/target/release/bundle/macos/Text Search Tool.app)
+    Bundling Text Search Tool_0.1.0_aarch64.dmg (/Users/huyingjie/dev/rust-demos/text-search-tool/target/release/bundle/dmg/Text Search Tool_0.1.0_aarch64.dmg)
+     Running bundle_dmg.sh
+    Finished 2 bundles at:
+        /Users/huyingjie/dev/rust-demos/text-search-tool/target/release/bundle/macos/Text Search Tool.app
+        /Users/huyingjie/dev/rust-demos/text-search-tool/target/release/bundle/dmg/Text Search Tool_0.1.0_aarch64.dmg
+

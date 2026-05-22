@@ -1,0 +1,12 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+crawler = { path = "../crawler" }
+search-engine = { path = "../search-engine" }
+sm4 = "0.5"
+ecb = { version = "0.1", features = ["alloc", "block-padding"] }
+hex = "0.4"
