@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Runtime data
+/.runtime-data/
+/src-tauri/data/*.db
+/src-tauri/data/*.db-*
+/src-tauri/data/session.json
+
+# Frontend
+/ui/node_modules/
+/ui/dist/
+/ui/.svelte-kit/
+/ui/.vite/
+
+# General build output
+/dist/

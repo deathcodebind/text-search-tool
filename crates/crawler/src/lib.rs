@@ -439,6 +439,71 @@ impl JxemallListNewestHttpClient {
             attachment_urls,
         })
     }
+
+    pub fn fetch_page_html(&self, url: &str) -> Result<String, AppError> {
+        let response = self
+            .client
+            .get(url)
+            .header(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(REFERER, &self.base_url)
+            .header(COOKIE, self.cookie_header.as_str())
+            .send()
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to fetch page html: {err}"),
+                )
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::new(
+                ErrorCode::Infrastructure,
+                format!("page fetch failed with https status {status}"),
+            ));
+        }
+
+        response.text().map_err(|err| {
+            AppError::new(
+                ErrorCode::Infrastructure,
+                format!("failed to read page html: {err}"),
+            )
+        })
+    }
+
+    pub fn download_attachment_bytes(&self, url: &str) -> Result<Vec<u8>, AppError> {
+        let response = self
+            .client
+            .get(url)
+            .header(ACCEPT, "*/*")
+            .header(REFERER, &self.base_url)
+            .header(COOKIE, self.cookie_header.as_str())
+            .send()
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to download attachment: {err}"),
+                )
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::new(
+                ErrorCode::Infrastructure,
+                format!("attachment download failed with http status {status}"),
+            ));
+        }
+
+        response
+            .bytes()
+            .map(|x| x.to_vec())
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to read attachment bytes: {err}"),
+                )
+            })
+    }
 }
 
 fn collect_text_fragments(value: &Value, out: &mut Vec<String>) {

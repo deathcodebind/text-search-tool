@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 #[cfg(not(test))]
 use std::thread;
@@ -98,10 +99,33 @@ struct PullRecordsQuery {
 #[serde(rename_all = "camelCase")]
 struct PullRecordDetailResponse {
   source_id: String,
+  title: String,
   detail_text: String,
   raw_json: String,
   source_page_url: String,
   attachment_urls: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchDetailPageHtmlResponse {
+  source_page_url: String,
+  html: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadAttachmentResponse {
+  source_id: String,
+  file_name: String,
+  file_path: String,
+  size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenExternalUrlResponse {
+  opened: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,7 +309,6 @@ fn set_login_base_url(base_url: &str) -> Result<(), String> {
   Ok(())
 }
 
-#[cfg(not(test))]
 fn current_api_base_url() -> Result<String, String> {
   let base = {
     let guard = LOGIN_BASE_URL
@@ -456,8 +479,22 @@ fn db_path() -> Result<PathBuf, String> {
   let mut candidate_dirs = Vec::new();
 
   if let Ok(mut cwd) = std::env::current_dir() {
-    cwd.push("data");
-    candidate_dirs.push(cwd);
+    #[cfg(debug_assertions)]
+    {
+      // In dev, keep sqlite out of src-tauri/data to avoid file-watch rebuild loops.
+      if cwd.ends_with("src-tauri") {
+        cwd.pop();
+      }
+      let mut dev_dir = cwd.clone();
+      dev_dir.push(".runtime-data");
+      candidate_dirs.push(dev_dir);
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+      cwd.push("data");
+      candidate_dirs.push(cwd);
+    }
   }
 
   if let Some(mut user_dir) = user_app_data_dir() {
@@ -502,15 +539,49 @@ fn save_login_session_state(base_url: &str, cookie_header: &str) -> Result<(), S
   std::fs::write(path, content).map_err(|e| format!("failed to persist login session state: {e}"))
 }
 
+fn read_login_session_state_from(path: &Path) -> Result<LoginSessionState, String> {
+  let content =
+    std::fs::read(path).map_err(|e| format!("failed to read login session state: {e}"))?;
+  serde_json::from_slice::<LoginSessionState>(&content)
+    .map_err(|e| format!("failed to parse login session state: {e}"))
+}
+
+fn legacy_session_state_paths() -> Vec<PathBuf> {
+  let mut paths = Vec::new();
+
+  if let Ok(mut cwd) = std::env::current_dir() {
+    let mut p1 = cwd.clone();
+    p1.push("data");
+    p1.push("session.json");
+    paths.push(p1);
+
+    if !cwd.ends_with("src-tauri") {
+      cwd.push("src-tauri");
+    }
+    cwd.push("data");
+    cwd.push("session.json");
+    paths.push(cwd);
+  }
+
+  paths
+}
+
 fn load_login_session_state() -> Result<Option<LoginSessionState>, String> {
   let path = session_state_path()?;
-  if !path.exists() {
-    return Ok(None);
+  if path.exists() {
+    return read_login_session_state_from(&path).map(Some);
   }
-  let content = std::fs::read(path).map_err(|e| format!("failed to read login session state: {e}"))?;
-  let state = serde_json::from_slice::<LoginSessionState>(&content)
-    .map_err(|e| format!("failed to parse login session state: {e}"))?;
-  Ok(Some(state))
+
+  for legacy_path in legacy_session_state_paths() {
+    if !legacy_path.exists() {
+      continue;
+    }
+    let state = read_login_session_state_from(&legacy_path)?;
+    let _ = save_login_session_state(&state.base_url, &state.cookie_header);
+    return Ok(Some(state));
+  }
+
+  Ok(None)
 }
 
 fn now_unix_secs() -> Result<i64, String> {
@@ -535,20 +606,6 @@ struct DemoPullRecord {
 #[cfg(test)]
 fn demo_records_for_pull() -> Vec<DemoPullRecord> {
   vec![
-    DemoPullRecord {
-      record: Record {
-        source_id: "pull-001".to_string(),
-        source_url: "https://example.local/1".to_string(),
-        title: "南昌弱电系统改造".to_string(),
-        region_code: "360103".to_string(),
-        published_at: 1_715_000_000,
-        expires_at: 1_817_000_000,
-      },
-      category_type: "PROJECT",
-      state: 4,
-      instance_code: "JXFWGC",
-      budget: 68000,
-    },
     DemoPullRecord {
       record: Record {
         source_id: "pull-002".to_string(),
@@ -1117,6 +1174,11 @@ fn pull_records(input: Option<PullRecordsQuery>) -> Result<PullRecordsResponse, 
 #[tauri::command]
 fn pull_record_detail(source_id: String) -> Result<PullRecordDetailResponse, String> {
   let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let title = repo
+    .get_record_by_source_id(&source_id)
+    .map_err(|e| e.message)?
+    .map(|x| x.title)
+    .unwrap_or_default();
   let payload = repo
     .get_record_detail_payload(&source_id)
     .map_err(|e| e.message)?
@@ -1124,11 +1186,154 @@ fn pull_record_detail(source_id: String) -> Result<PullRecordDetailResponse, Str
 
   Ok(PullRecordDetailResponse {
     source_id: payload.source_id,
+    title,
     detail_text: payload.detail_text,
     raw_json: payload.raw_json,
     source_page_url: payload.source_page_url,
     attachment_urls: payload.attachment_urls,
   })
+}
+
+#[tauri::command]
+fn fetch_detail_page_html(source_id: String) -> Result<FetchDetailPageHtmlResponse, String> {
+  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let detail_payload = repo
+    .get_record_detail_payload(&source_id)
+    .map_err(|e| e.message)?;
+  let source_page_url = if let Some(payload) = detail_payload {
+    payload.source_page_url
+  } else {
+    repo
+      .get_record_by_source_id(&source_id)
+      .map_err(|e| e.message)?
+      .map(|x| x.source_url)
+      .ok_or_else(|| "record not found".to_string())?
+  };
+  if source_page_url.trim().is_empty() {
+    return Err("source page url is not available".to_string());
+  }
+
+  let session_cookie = require_login_session_cookie()?;
+  let api_base = current_api_base_url()?;
+  let client = crawler::JxemallListNewestHttpClient::new(api_base, session_cookie)
+    .map_err(|e| e.message)?;
+  let html = client.fetch_page_html(&source_page_url).map_err(|e| e.message)?;
+
+  Ok(FetchDetailPageHtmlResponse {
+    source_page_url,
+    html,
+  })
+}
+
+fn decode_url_file_name(url: &str) -> Option<String> {
+  let path = url.split('?').next().unwrap_or(url);
+  let name = path.rsplit('/').next()?.trim();
+  if name.is_empty() {
+    return None;
+  }
+  Some(name.replace('%', "_"))
+}
+
+fn safe_file_name(name: &str) -> String {
+  let mut s = String::new();
+  for ch in name.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+      s.push(ch);
+    } else {
+      s.push('_');
+    }
+  }
+  let trimmed = s.trim_matches('_');
+  if trimmed.is_empty() {
+    "attachment.bin".to_string()
+  } else {
+    trimmed.to_string()
+  }
+}
+
+#[tauri::command]
+fn download_attachment(source_id: String, url: String) -> Result<DownloadAttachmentResponse, String> {
+  let trimmed = url.trim();
+  if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+    return Err("invalid attachment url".to_string());
+  }
+
+  let session_cookie = require_login_session_cookie()?;
+  let api_base = current_api_base_url()?;
+  let client = crawler::JxemallListNewestHttpClient::new(api_base, session_cookie)
+    .map_err(|e| e.message)?;
+  let data = client
+    .download_attachment_bytes(trimmed)
+    .map_err(|e| e.message)?;
+
+  let mut dir = db_path()?;
+  let _ = dir.pop();
+  dir.push("attachments");
+  std::fs::create_dir_all(&dir)
+    .map_err(|e| format!("failed to create attachments dir: {e}"))?;
+
+  let guessed = decode_url_file_name(trimmed).unwrap_or_else(|| format!("{source_id}.bin"));
+  let file_name = safe_file_name(&guessed);
+  let unique_name = format!(
+    "{}-{}-{}",
+    source_id,
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_err(|e| format!("failed to read clock: {e}"))?
+      .as_millis(),
+    file_name
+  );
+
+  let mut path = dir;
+  path.push(unique_name);
+  std::fs::write(&path, &data)
+    .map_err(|e| format!("failed to write attachment file: {e}"))?;
+
+  Ok(DownloadAttachmentResponse {
+    source_id,
+    file_name,
+    file_path: path.to_string_lossy().to_string(),
+    size: data.len() as u64,
+  })
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<OpenExternalUrlResponse, String> {
+  let trimmed = url.trim();
+  if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+    return Err("invalid url".to_string());
+  }
+
+  #[cfg(target_os = "macos")]
+  let mut cmd = {
+    let mut c = Command::new("open");
+    c.arg(trimmed);
+    c
+  };
+
+  #[cfg(target_os = "linux")]
+  let mut cmd = {
+    let mut c = Command::new("xdg-open");
+    c.arg(trimmed);
+    c
+  };
+
+  #[cfg(target_os = "windows")]
+  let mut cmd = {
+    let mut c = Command::new("cmd");
+    c.args(["/C", "start", "", trimmed]);
+    c
+  };
+
+  let status = cmd
+    .status()
+    .map_err(|e| format!("failed to open external url: {e}"))?;
+
+  if !status.success() {
+    return Err(format!("failed to open external url, exit status: {status}"));
+  }
+
+  Ok(OpenExternalUrlResponse { opened: true })
 }
 
 #[tauri::command]
@@ -1332,6 +1537,9 @@ pub fn run() {
       pull_progress,
       pull_records,
       pull_record_detail,
+      fetch_detail_page_html,
+      download_attachment,
+      open_external_url,
       pull_retry_detail,
       preview_bool_query,
       preview_keyword_groups

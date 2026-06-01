@@ -1,0 +1,25 @@
+{
+  "name": "text-search-tool-ui",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@shoelace-style/shoelace": "^2.20.1",
+    "@tanstack/svelte-query": "^5.0.0",
+    "@tauri-apps/api": "^2.5.0",
+    "svelte": "^4.0.0",
+    "svelte-spa-router": "^4.0.2"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.0",
+    "@types/node": "^20.14.2",
+    "svelte-preprocess": "^5.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.1"
+  }
+}
