@@ -35,6 +35,20 @@ pub fn persist_crawl_batch<R: StorageRepository>(
         }
     };
 
+    let source_ids = records
+        .iter()
+        .map(|record| record.source_id.clone())
+        .collect::<Vec<_>>();
+    if let Err(err) = repo.associate_job_records(job_id, &source_ids) {
+        let err_message = err.message.clone();
+        let _ = repo.mark_job_status(
+            job_id,
+            shared::CrawlJobStatus::Failed,
+            Some(err_message.as_str()),
+        );
+        return Err(err);
+    }
+
     repo.mark_job_status(job_id, shared::CrawlJobStatus::Succeeded, Some("ingest completed"))?;
     Ok(upserted)
 }
@@ -51,6 +65,7 @@ pub const JXEMALL_LIST_NEWEST_REFERER_BIDDING: &str =
 pub const JXEMALL_DETAIL_PATH: &str = "/api/sparta/announcement/detail";
 pub const JXEMALL_DETAIL_REFERER_TEMPLATE: &str =
     "https://www.jxemall.com/luban/bidding/detail?requisitionId={requisitionId}&type={type}";
+const JXEMALL_LIST_NEWEST_MAX_PAGES: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JxemallLoginFormInput {
@@ -236,6 +251,44 @@ impl JxemallListNewestHttpClient {
     }
 
     pub fn list_newest_summaries(
+        &self,
+        payload: &JxemallListNewestRequest,
+    ) -> Result<Vec<JxemallAnnouncementSummary>, AppError> {
+        let start_page = payload.page_no.max(1);
+        let page_size = payload.page_size.max(1);
+        let mut page_no = start_page;
+        let mut all_items = Vec::new();
+        let mut seen_source_ids = HashSet::new();
+
+        loop {
+            if page_no.saturating_sub(start_page) >= JXEMALL_LIST_NEWEST_MAX_PAGES {
+                break;
+            }
+
+            let mut next_payload = payload.clone();
+            next_payload.page_no = page_no;
+            next_payload.page_size = page_size;
+
+            let page_items = self.list_newest_summaries_page(&next_payload)?;
+            let page_len = page_items.len() as u32;
+
+            for item in page_items {
+                if seen_source_ids.insert(item.record.source_id.clone()) {
+                    all_items.push(item);
+                }
+            }
+
+            if page_len < page_size {
+                break;
+            }
+
+            page_no = page_no.saturating_add(1);
+        }
+
+        Ok(all_items)
+    }
+
+    fn list_newest_summaries_page(
         &self,
         payload: &JxemallListNewestRequest,
     ) -> Result<Vec<JxemallAnnouncementSummary>, AppError> {

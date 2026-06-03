@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -65,6 +65,14 @@ struct PullProgressResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PullCancelResponse {
+  job_id: String,
+  accepted: bool,
+  message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PullRecordItem {
   source_id: String,
   source_url: String,
@@ -91,6 +99,7 @@ struct PullRecordsResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRecordsQuery {
+  job_id: Option<String>,
   page: Option<u32>,
   page_size: Option<u32>,
 }
@@ -220,6 +229,8 @@ struct LoginSessionState {
 
 static PULL_JOBS: Lazy<Mutex<HashMap<String, PullProgressResponse>>> =
   Lazy::new(|| Mutex::new(HashMap::new()));
+static CANCELED_PULL_JOBS: Lazy<Mutex<HashSet<String>>> =
+  Lazy::new(|| Mutex::new(HashSet::new()));
 static LOGIN_SESSION_COOKIE: Lazy<Mutex<Option<String>>> =
   Lazy::new(|| Mutex::new(None));
 static LOGIN_BASE_URL: Lazy<Mutex<Option<String>>> =
@@ -227,6 +238,120 @@ static LOGIN_BASE_URL: Lazy<Mutex<Option<String>>> =
 
 const DEFAULT_INSTANCE_CODES: [&str; 4] = ["JXWSCS", "JXDDCG", "JXXYGH", "JXFWGC"];
 const DETAIL_JOB_STALLED_SECONDS: i64 = 120;
+#[cfg(not(test))]
+const PULL_FETCH_PAGE_SIZE: u32 = 100;
+
+fn set_pull_job_progress(progress: PullProgressResponse) -> Result<(), String> {
+  if progress.status != "canceled" {
+    let canceled = CANCELED_PULL_JOBS
+      .lock()
+      .map_err(|_| "failed to lock canceled pull jobs state".to_string())?;
+    if canceled.contains(&progress.job_id) {
+      return Ok(());
+    }
+  }
+
+  let mut jobs = PULL_JOBS
+    .lock()
+    .map_err(|_| "failed to lock pull jobs state".to_string())?;
+  jobs.insert(progress.job_id.clone(), progress);
+  Ok(())
+}
+
+fn is_pull_job_canceled(job_id: &str) -> Result<bool, String> {
+  let canceled = CANCELED_PULL_JOBS
+    .lock()
+    .map_err(|_| "failed to lock canceled pull jobs state".to_string())?;
+  Ok(canceled.contains(job_id))
+}
+
+fn execute_pull_job(
+  job_id: String,
+  input: PullRequest,
+  session_cookie: String,
+  effective_state_list: Vec<u32>,
+  effective_sort_field: String,
+  effective_sort_method: String,
+  expires_at: i64,
+) -> Result<(), String> {
+  if is_pull_job_canceled(&job_id)? {
+    return Ok(());
+  }
+
+  let pull_result = fetch_pull_records(
+    &input,
+    &session_cookie,
+    &effective_state_list,
+    &effective_sort_field,
+    &effective_sort_method,
+  )?;
+
+  let mut persisted_records = pull_result.records;
+  let has_detail_tasks = !pull_result.detail_targets.is_empty();
+
+  if is_pull_job_canceled(&job_id)? {
+    return Ok(());
+  }
+
+  for record in &mut persisted_records {
+    record.expires_at = expires_at;
+  }
+
+  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let inserted = persist_crawl_batch(&repo, &job_id, &persisted_records).map_err(|e| e.message)?;
+
+  #[cfg(not(test))]
+  {
+    if has_detail_tasks {
+      for target in &pull_result.detail_targets {
+        let _ = repo.upsert_record_detail_job_status(
+          &target.source_id,
+          "queued",
+          Some("waiting for background detail sync"),
+          1,
+        );
+      }
+
+      let base_url = current_api_base_url()?;
+      run_detail_sync_async(
+        job_id.clone(),
+        base_url,
+        session_cookie.clone(),
+        pull_result.detail_targets.clone(),
+        1,
+      );
+    }
+  }
+
+  let summary = format!(
+    "cookie={}, category={:?}, states={:?}, instances={:?}, budget={:?}-{:?}, sort={:?}/{:?}",
+    session_cookie,
+    input.category_type,
+    effective_state_list,
+    effective_instance_codes(&input),
+    input.min_budget,
+    input.max_budget,
+    Some(effective_sort_field),
+    Some(effective_sort_method),
+  );
+
+  set_pull_job_progress(PullProgressResponse {
+    job_id,
+    status: if has_detail_tasks {
+      "running".to_string()
+    } else {
+      "succeeded".to_string()
+    },
+    processed: inserted,
+    total: inserted,
+    message: format!(
+      "list pull completed, persisted {inserted} records; detail sync {} in background, {summary}",
+      if has_detail_tasks { "running" } else { "skipped" }
+    ),
+  })?;
+
+  Ok(())
+}
 
 fn extract_query_value(url: &str, key: &str) -> Option<String> {
   let query = url.split_once('?')?.1;
@@ -307,6 +432,24 @@ fn set_login_base_url(base_url: &str) -> Result<(), String> {
     .map_err(|_| "failed to lock login base url state".to_string())?;
   *guard = Some(base_url.trim().to_string());
   Ok(())
+}
+
+fn canonical_login_base_url(raw: &str) -> String {
+  let trimmed = raw.trim().trim_end_matches('/');
+  if trimmed.contains("jxemall.com") {
+    "https://login.jxemall.com".to_string()
+  } else {
+    trimmed.to_string()
+  }
+}
+
+fn canonical_api_base_url(raw: &str) -> String {
+  let trimmed = raw.trim().trim_end_matches('/');
+  if trimmed.contains("jxemall.com") {
+    "https://www.jxemall.com".to_string()
+  } else {
+    trimmed.to_string()
+  }
 }
 
 fn current_api_base_url() -> Result<String, String> {
@@ -708,7 +851,7 @@ fn fetch_pull_records(
       trade_model: "BIDDING".to_string(),
       category_type: input.category_type.clone(),
       page_no: 1,
-      page_size: 20,
+      page_size: PULL_FETCH_PAGE_SIZE,
       state_list: effective_state_list.to_vec(),
       other_search: input.keyword_hint.clone().unwrap_or_default(),
       min_budget: input.min_budget,
@@ -936,8 +1079,10 @@ fn app_snapshot() -> AppSnapshot {
 
 #[tauri::command]
 fn login_submit(input: LoginInput) -> Result<LoginResponse, String> {
-  let base_url = input.base_url.trim().to_string();
-  let client = CrawlerLoginApiClient::new(base_url.clone(), input.cookie_header)
+  let login_base_url = canonical_login_base_url(&input.base_url);
+  let api_base_url = canonical_api_base_url(&input.base_url);
+
+  let client = CrawlerLoginApiClient::new(login_base_url, input.cookie_header)
     .map_err(|e| format!("failed to initialize login client: {}", e.message))?;
 
   let response = client
@@ -949,10 +1094,10 @@ fn login_submit(input: LoginInput) -> Result<LoginResponse, String> {
     .map_err(|e| e.message)?;
 
   set_login_session_cookie_from_credential_ref(&response.credential_ref)?;
-  set_login_base_url(&base_url)?;
+  set_login_base_url(&api_base_url)?;
 
   if let Some(cookie_header) = require_login_session_cookie().ok() {
-    let _ = save_login_session_state(&base_url, &cookie_header);
+    let _ = save_login_session_state(&api_base_url, &cookie_header);
   }
 
   Ok(LoginResponse {
@@ -988,97 +1133,55 @@ fn pull_start(input: PullRequest) -> Result<PullStartResponse, String> {
   let expires_at = now_secs + 3 * 24 * 60 * 60;
   let job_id = format!("job-{now}");
 
+  set_pull_job_progress(PullProgressResponse {
+    job_id: job_id.clone(),
+    status: "running".to_string(),
+    processed: 0,
+    total: 0,
+    message: "pull started with filters".to_string(),
+  })?;
+
+  #[cfg(test)]
   {
-    let mut jobs = PULL_JOBS
-      .lock()
-      .map_err(|_| "failed to lock pull jobs state".to_string())?;
-    jobs.insert(
+    execute_pull_job(
       job_id.clone(),
-      PullProgressResponse {
-        job_id: job_id.clone(),
-        status: "running".to_string(),
-        processed: 0,
-        total: 0,
-          message: "pull started with filters".to_string(),
-      },
-    );
+      input,
+      session_cookie,
+      effective_state_list,
+      effective_sort_field,
+      effective_sort_method,
+      expires_at,
+    )?;
   }
-
-  let pull_result = fetch_pull_records(
-    &input,
-    &session_cookie,
-    &effective_state_list,
-    &effective_sort_field,
-    &effective_sort_method,
-  )?;
-
-  let mut persisted_records = pull_result.records;
-  let has_detail_tasks = !pull_result.detail_targets.is_empty();
-
-  for record in &mut persisted_records {
-    // 产品约定：拉取后入库记录统一设置 3 天过期时间。
-    record.expires_at = expires_at;
-  }
-
-  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
-  let inserted = persist_crawl_batch(&repo, &job_id, &persisted_records).map_err(|e| e.message)?;
 
   #[cfg(not(test))]
   {
-    if has_detail_tasks {
-      for target in &pull_result.detail_targets {
-        let _ = repo.upsert_record_detail_job_status(
-          &target.source_id,
-          "queued",
-          Some("waiting for background detail sync"),
-          1,
-        );
+    let job_id_for_thread = job_id.clone();
+    let input_for_thread = input;
+    let session_cookie_for_thread = session_cookie;
+    let effective_state_list_for_thread = effective_state_list;
+    let effective_sort_field_for_thread = effective_sort_field;
+    let effective_sort_method_for_thread = effective_sort_method;
+
+    thread::spawn(move || {
+      if let Err(error) = execute_pull_job(
+        job_id_for_thread.clone(),
+        input_for_thread,
+        session_cookie_for_thread,
+        effective_state_list_for_thread,
+        effective_sort_field_for_thread,
+        effective_sort_method_for_thread,
+        expires_at,
+      ) {
+        let _ = set_pull_job_progress(PullProgressResponse {
+          job_id: job_id_for_thread,
+          status: "failed".to_string(),
+          processed: 0,
+          total: 0,
+          message: error,
+        });
       }
-
-      let base_url = current_api_base_url()?;
-      run_detail_sync_async(
-        job_id.clone(),
-        base_url,
-        session_cookie.clone(),
-        pull_result.detail_targets.clone(),
-        1,
-      );
-    }
-  }
-
-  let summary = format!(
-    "cookie={}, category={:?}, states={:?}, instances={:?}, budget={:?}-{:?}, sort={:?}/{:?}",
-    session_cookie,
-    input.category_type,
-    effective_state_list,
-    effective_instance_codes(&input),
-    input.min_budget,
-    input.max_budget,
-    Some(effective_sort_field),
-    Some(effective_sort_method),
-  );
-
-  {
-    let mut jobs = PULL_JOBS
-      .lock()
-      .map_err(|_| "failed to lock pull jobs state".to_string())?;
-    jobs.insert(
-      job_id.clone(),
-      PullProgressResponse {
-        job_id: job_id.clone(),
-        status: if has_detail_tasks {
-          "running".to_string()
-        } else {
-          "succeeded".to_string()
-        },
-        processed: inserted,
-        total: inserted,
-        message: format!(
-          "list pull completed, persisted {inserted} records; detail sync {} in background, {summary}",
-          if has_detail_tasks { "running" } else { "skipped" }
-        ),
-      },
-    );
+    });
   }
 
   Ok(PullStartResponse {
@@ -1089,20 +1192,98 @@ fn pull_start(input: PullRequest) -> Result<PullStartResponse, String> {
 
 #[tauri::command]
 fn pull_progress(job_id: String) -> Result<PullProgressResponse, String> {
-  let jobs = PULL_JOBS
-    .lock()
-    .map_err(|_| "failed to lock pull jobs state".to_string())?;
+  {
+    let jobs = PULL_JOBS
+      .lock()
+      .map_err(|_| "failed to lock pull jobs state".to_string())?;
 
-  jobs
-    .get(&job_id)
-    .cloned()
-    .ok_or_else(|| "job not found".to_string())
+    if let Some(progress) = jobs.get(&job_id).cloned() {
+      return Ok(progress);
+    }
+  }
+
+  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let status = repo
+    .get_job_status(&job_id)
+    .map_err(|e| e.message)?
+    .ok_or_else(|| "job not found".to_string())?;
+  let processed = repo.count_job_records(&job_id).map_err(|e| e.message)?;
+  let message = repo
+    .get_job_message(&job_id)
+    .map_err(|e| e.message)?
+    .unwrap_or_else(|| "progress restored from storage".to_string());
+
+  let progress = PullProgressResponse {
+    job_id: job_id.clone(),
+    status: if message.to_ascii_lowercase().contains("canceled") {
+      "canceled".to_string()
+    } else {
+      match status {
+      shared::CrawlJobStatus::Pending => "pending".to_string(),
+      shared::CrawlJobStatus::Running => "running".to_string(),
+      shared::CrawlJobStatus::Succeeded => "succeeded".to_string(),
+      shared::CrawlJobStatus::Failed => "failed".to_string(),
+      }
+    },
+    processed,
+    total: processed,
+    message,
+  };
+
+  let _ = set_pull_job_progress(progress.clone());
+  Ok(progress)
+}
+
+#[tauri::command]
+fn pull_cancel(job_id: String) -> Result<PullCancelResponse, String> {
+  {
+    let mut canceled = CANCELED_PULL_JOBS
+      .lock()
+      .map_err(|_| "failed to lock canceled pull jobs state".to_string())?;
+    canceled.insert(job_id.clone());
+  }
+
+  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let _ = storage::StorageRepository::mark_job_status(
+    &repo,
+    &job_id,
+    shared::CrawlJobStatus::Failed,
+    Some("canceled by user"),
+  );
+
+  let processed = repo.count_job_records(&job_id).unwrap_or(0);
+  let progress = PullProgressResponse {
+    job_id: job_id.clone(),
+    status: "canceled".to_string(),
+    processed,
+    total: processed,
+    message: "当前任务已取消".to_string(),
+  };
+  let _ = set_pull_job_progress(progress);
+
+  Ok(PullCancelResponse {
+    job_id,
+    accepted: true,
+    message: "当前任务已取消".to_string(),
+  })
 }
 
 #[tauri::command]
 fn pull_records(input: Option<PullRecordsQuery>) -> Result<PullRecordsResponse, String> {
   let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
-  let all = repo.list_record_documents().map_err(|e| e.message)?;
+  let job_id = input
+    .as_ref()
+    .and_then(|x| x.job_id.as_ref())
+    .map(|x| x.trim())
+    .filter(|x| !x.is_empty())
+    .map(|x| x.to_string());
+  let all = if let Some(job_id) = job_id.as_deref() {
+    repo
+      .list_record_documents_by_job(job_id)
+      .map_err(|e| e.message)?
+  } else {
+    Vec::new()
+  };
   let now_secs = now_unix_secs()?;
   let total = all.len() as u64;
   let page = input
@@ -1534,6 +1715,7 @@ pub fn run() {
       app_snapshot,
       login_submit,
       pull_start,
+      pull_cancel,
       pull_progress,
       pull_records,
       pull_record_detail,
@@ -1604,10 +1786,10 @@ mod tests {
       .expect("clock should work")
       .as_secs() as i64;
 
-    pull_start(PullRequest {
+    let started = pull_start(PullRequest {
       district_codes: vec!["360103".to_string(), "360111".to_string()],
       category_type: None,
-      state_list: Vec::new(),
+      state_list: vec![3],
       instance_codes: Vec::new(),
       min_budget: None,
       max_budget: None,
@@ -1618,6 +1800,7 @@ mod tests {
     .expect("pull should pass after login");
 
     let result = pull_records(Some(PullRecordsQuery {
+      job_id: Some(started.job_id),
       page: Some(1),
       page_size: Some(20),
     }))

@@ -3,15 +3,34 @@
   import { loginSubmit } from "../lib/api";
   import { onDestroy, onMount } from "svelte";
 
-  let baseUrl = "https://login.jxemall.com";
+  const SITE_OPTIONS = [
+    {
+      key: "jxemall",
+      label: "江西省政府采购电子卖场",
+      baseUrl: "https://login.jxemall.com",
+    },
+  ];
+
+  let selectedSite = "jxemall";
   let username = "";
   let password = "";
   let remember = true;
   let status = "";
   let loginState = { baseUrl: "", username: "", remember: false };
 
+  function baseUrlFromSite(siteKey: string) {
+    return SITE_OPTIONS.find((item) => item.key === siteKey)?.baseUrl || SITE_OPTIONS[0].baseUrl;
+  }
+
+  function siteFromBaseUrl(baseUrl: string) {
+    if (baseUrl.includes("jxemall.com")) {
+      return "jxemall";
+    }
+    return "jxemall";
+  }
+
   const subscription = loginStore.subscribe((value) => {
-    baseUrl = value.baseUrl;
+    selectedSite = siteFromBaseUrl(value.baseUrl || "");
     username = value.username;
     remember = value.remember;
     loginState = value;
@@ -26,6 +45,7 @@
   async function submit() {
     try {
       status = "登录中...";
+      const baseUrl = baseUrlFromSite(selectedSite);
       const result = await loginSubmit({ baseUrl, username, password });
       status = `登录成功：${result}`;
       loginStore.set({ baseUrl, username, remember });
@@ -59,6 +79,13 @@
     border-radius: 8px;
   }
 
+  select {
+    padding: 10px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #ffffff;
+  }
+
   button {
     width: fit-content;
   }
@@ -67,8 +94,12 @@
 <h2>登录</h2>
 <form on:submit|preventDefault={submit}>
   <label>
-    登录 Base URL
-    <input bind:value={baseUrl} placeholder="https://login.jxemall.com" />
+    网站
+    <select bind:value={selectedSite}>
+      {#each SITE_OPTIONS as site}
+        <option value={site.key}>{site.label}</option>
+      {/each}
+    </select>
   </label>
 
   <label>

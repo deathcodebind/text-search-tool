@@ -26,8 +26,12 @@ export function pullStart(input: PullStartInput) {
   return invoke("pull_start", { input });
 }
 
-export function pullRecords(page = 1, pageSize = 10) {
-  return invoke("pull_records", { input: { page, pageSize } });
+export function pullCancel(jobId: string) {
+  return invoke("pull_cancel", { jobId });
+}
+
+export function pullRecords(jobId: string, page = 1, pageSize = 10) {
+  return invoke("pull_records", { input: { jobId, page, pageSize } });
 }
 
 export function pullProgress(jobId: string) {

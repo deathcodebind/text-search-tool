@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { derived, writable } from "svelte/store";
+  import { derived, get, writable } from "svelte/store";
   import { onDestroy, onMount } from "svelte";
-  import { pullStart, pullRecords, pullProgress, fetchDetailPageHtml } from "../lib/api";
+  import { pullStart, pullCancel, pullRecords, pullProgress, fetchDetailPageHtml } from "../lib/api";
   import { loginStore, keywordRuleSetsStore, activeKeywordRuleStore, keywordEditorTargetRuleStore } from "../lib/stores";
   import { JXEMALL_DISTRICT_OPTIONS } from "../../jxemall-district-options.js";
   import Keyword from "./Keyword.svelte";
@@ -14,11 +14,15 @@
   const page = writable(1);
   const pageSize = 10;
   const TASK_HISTORY_KEY = "text-search-tool.pull-task-history.v1";
+  const PULL_PROGRESS_POLL_INTERVAL_MS = 4000;
 
   type PullTaskHistoryEntry = {
     jobId: string;
     startedAt: string;
     updatedAt: string;
+    expiresAt?: string;
+    requestSignature?: string;
+    ruleSignature?: string;
     filterSummary: string;
     progressText: string;
     snapshotCount: number;
@@ -34,6 +38,8 @@
   let isKeywordEditorOpen = false;
   let keywordEditorDialog: any;
   let taskHistoryDialog: any;
+  let startPullConfirmDialog: any;
+  let stateWarningDialog: any;
   let embeddedBrowserDialog: any;
   let isEmbeddedBrowserOpen = false;
   let embeddedBrowserLoading = false;
@@ -48,6 +54,15 @@
   let activeRuleLabel = "未应用";
   let activeRuleConfig: any = null;
   let loginState = { baseUrl: "", username: "", remember: false };
+  let suppressNextAutoLoad = false;
+  let pullProgressPollTimer: ReturnType<typeof setInterval> | null = null;
+  let isPollingProgress = false;
+  let startPullConfirmTitle = "";
+  let startPullConfirmMessage = "";
+  let startPullConfirmActionLabel = "确认";
+  let startPullConfirmResolved = false;
+  let startPullConfirmResolver: ((confirmed: boolean) => void) | null = null;
+  let stateWarningMessage = "";
 
   const isProvinceCode = (code: string) => code.slice(2) === "0000";
   const isCityCode = (code: string) => code.slice(4) === "00" && code.slice(2, 4) !== "00";
@@ -63,12 +78,12 @@
   let isCountyDropdownOpen = false;
   let isFilterSectionOpen = true;
   let quickCategory = "all";
-  let quickState = "all";
+  let quickState = "bidding";
   let quickInstance = "all";
   let quickBudget = "all";
 
   let selectedCategoryType = "";
-  let selectedStateList: number[] = [3, 4, 5, 6, 7, 10, 12, 50];
+  let selectedStateList: number[] = [4];
   let selectedInstanceCodes: string[] = ["JXWSCS", "JXDDCG", "JXXYGH", "JXFWGC"];
   let minBudgetInput = "";
   let maxBudgetInput = "";
@@ -172,6 +187,7 @@
   });
 
   onMount(() => {
+    selectQuickState("bidding", false);
     restoreTaskHistory();
     if (!loginState.username) {
       window.location.hash = "#/login";
@@ -179,10 +195,60 @@
   });
 
   onDestroy(() => {
+    stopAutoPolling();
     unsubscribeLogin();
     unsubscribeNamedRules();
     unsubscribeActiveRule();
   });
+
+  function isTerminalPullStatus(status: string) {
+    const normalized = status.trim().toLowerCase();
+    return normalized === "succeeded" || normalized === "failed" || normalized === "canceled";
+  }
+
+  function stopAutoPolling() {
+    if (pullProgressPollTimer) {
+      clearInterval(pullProgressPollTimer);
+      pullProgressPollTimer = null;
+    }
+  }
+
+  function startAutoPolling() {
+    if (pullProgressPollTimer || !get(currentJobId)) {
+      return;
+    }
+
+    pullProgressPollTimer = setInterval(() => {
+      void queryProgress(true);
+    }, PULL_PROGRESS_POLL_INTERVAL_MS);
+  }
+
+  function openStartPullConfirmDialog(title: string, message: string, actionLabel: string) {
+    startPullConfirmTitle = title;
+    startPullConfirmMessage = message;
+    startPullConfirmActionLabel = actionLabel;
+    startPullConfirmResolved = false;
+
+    return new Promise<boolean>((resolve) => {
+      startPullConfirmResolver = resolve;
+      startPullConfirmDialog?.show();
+    });
+  }
+
+  function resolveStartPullConfirm(confirmed: boolean) {
+    if (startPullConfirmResolved) {
+      return;
+    }
+    startPullConfirmResolved = true;
+    const resolver = startPullConfirmResolver;
+    startPullConfirmResolver = null;
+    resolver?.(confirmed);
+  }
+
+  function openStateWarningDialog(message: string) {
+    stateWarningMessage = message;
+    stateWarningDialog?.show();
+  }
 
   function toggleDistrict(code: string) {
     selectedDistricts.update((current) => {
@@ -196,7 +262,7 @@
   function addVisibleDistricts() {
     selectedDistricts.update((current) => {
       const next = new Set(current);
-      const source = $regionKeyword.trim() ? filteredCounties : currentCounties;
+      const source = get(regionKeyword).trim() ? filteredCounties : currentCounties;
       for (const district of source) {
         next.add(district.code);
       }
@@ -240,6 +306,9 @@
         return;
       }
       taskHistory = parsed.filter((item) => item && typeof item.jobId === "string").slice(0, 20);
+      if (taskHistory.length > 0 && !get(currentJobId)) {
+        currentJobId.set(taskHistory[0].jobId);
+      }
     } catch {
       taskHistory = [];
     }
@@ -264,7 +333,7 @@
   }
 
   function buildFilterSummary() {
-    const districtCount = $selectedDistricts.length;
+    const districtCount = get(selectedDistricts).length;
     const districtText = districtCount > 0 ? `${districtCount} 个地区` : "全部地区";
     return [
       `采购内容:${resolveQuickLabel(quickCategoryOptions, quickCategory)}`,
@@ -283,12 +352,46 @@
     return date.toLocaleString();
   }
 
+  function buildCurrentPullRequestSignature() {
+    return JSON.stringify({
+      districtCodes: [...get(selectedDistricts)].sort(),
+      categoryType: selectedCategoryType || null,
+      stateList: [...selectedStateList].sort((a, b) => a - b),
+      instanceCodes: [...selectedInstanceCodes].sort(),
+      minBudgetInput: minBudgetInput.trim(),
+      maxBudgetInput: maxBudgetInput.trim(),
+      sortField: selectedSortField,
+      sortMethod: selectedSortMethod,
+    });
+  }
+
+  function buildCurrentRuleSignature() {
+    if (!activeRuleConfig) {
+      return "none";
+    }
+    return JSON.stringify(activeRuleConfig);
+  }
+
+  function isTaskStillRunning(entry?: PullTaskHistoryEntry) {
+    if (!entry) {
+      return false;
+    }
+    const text = (entry.progressText || "").toLowerCase();
+    return !text.includes("succeeded")
+      && !text.includes("failed")
+      && !text.includes("canceled")
+      && !text.includes("已取消")
+      && !text.includes("无新拉取项目");
+  }
+
   function rememberTaskStart(jobId: string) {
     const nowIso = new Date().toISOString();
     upsertTaskHistory({
       jobId,
       startedAt: nowIso,
       updatedAt: nowIso,
+      requestSignature: buildCurrentPullRequestSignature(),
+      ruleSignature: buildCurrentRuleSignature(),
       filterSummary: buildFilterSummary(),
       progressText: "已启动",
       snapshotCount: 0,
@@ -314,9 +417,11 @@
       return;
     }
     const sourceIds = allRecords.map((item) => item.sourceId).filter(Boolean);
+    const expiresAt = allRecords[0]?.expiresAt;
     upsertTaskHistory({
       ...existing,
       updatedAt: new Date().toISOString(),
+      expiresAt: typeof expiresAt === "number" ? new Date(expiresAt * 1000).toISOString() : existing.expiresAt,
       snapshotCount: sourceIds.length,
       snapshotSourceIds: sourceIds.slice(0, 20),
     });
@@ -351,9 +456,11 @@
     });
   }
 
-  function useHistoryJob(jobId: string) {
+  async function useHistoryJob(jobId: string) {
     currentJobId.set(jobId);
     pullStatus.set(`已切换任务：${jobId}`);
+    page.set(1);
+    await loadRecords();
   }
 
   function openTaskHistoryDialog() {
@@ -366,10 +473,14 @@
     selectedCategoryType = option?.value || "";
   }
 
-  function selectQuickState(key: string) {
+  function selectQuickState(key: string, shouldWarn = true) {
     quickState = key;
     const option = quickStateOptions.find((item) => item.key === key);
-    selectedStateList = option ? [...option.values] : [3, 4, 5, 6, 7, 10, 12, 50];
+    selectedStateList = option ? [...option.values] : [4];
+
+    if (shouldWarn && key !== "bidding") {
+      openStateWarningDialog("不推荐拉取非竞价中的数据，建议优先选择“竞价中”。");
+    }
   }
 
   function selectQuickInstance(key: string) {
@@ -426,8 +537,69 @@
     records.set(allRecords.filter((record) => recordMatchesRule(record, config)));
   }
 
+  async function guardBeforeStartPull() {
+    const activeJobId = get(currentJobId);
+    if (!activeJobId) {
+      return true;
+    }
+
+    const runningEntry = taskHistory.find((item) => item.jobId === activeJobId);
+    let liveStatus = "";
+
+    try {
+      const progress = await pullProgress(activeJobId);
+      liveStatus = (progress?.status || "").toLowerCase();
+      updateTaskProgress(activeJobId, `状态：${progress.status}；${progress.processed}/${progress.total}`);
+      if (isTerminalPullStatus(progress.status)) {
+        return true;
+      }
+    } catch {
+      if (!isTaskStillRunning(runningEntry)) {
+        return true;
+      }
+    }
+
+    const sameRequest = runningEntry?.requestSignature === buildCurrentPullRequestSignature();
+    const sameRule = (runningEntry?.ruleSignature || "none") === buildCurrentRuleSignature();
+
+    if (sameRequest && sameRule) {
+      const confirmed = await openStartPullConfirmDialog(
+        "重复拉取确认",
+        "和上次任务的筛选项及关键词规则均无变化。拉取源数据可能已经更新，是否仍然要启动新任务重新拉取？",
+        "仍然启动新任务"
+      );
+      if (!confirmed) {
+        pullStatus.set("当前任务需求无变化，已取消重复启动");
+        return false;
+      }
+    } else {
+      const confirmed = await openStartPullConfirmDialog(
+        "任务切换确认",
+        "当前任务尚未完成。是否停止当前任务，并按新的筛选条件或关键词规则开始新的拉取任务？",
+        "停止当前任务并启动新任务"
+      );
+      if (!confirmed) {
+        pullStatus.set("当前任务继续执行，未启动新任务");
+        return false;
+      }
+    }
+
+    if (activeJobId) {
+      await pullCancel(activeJobId);
+      updateTaskProgress(activeJobId, "已取消");
+      stopAutoPolling();
+    }
+
+    return true;
+  }
+
   async function startPull() {
     try {
+      const shouldStart = await guardBeforeStartPull();
+      if (!shouldStart) {
+        return;
+      }
+
       pullStatus.set("启动中...");
       const minBudget = parseOptionalBudget(minBudgetInput);
       const maxBudget = parseOptionalBudget(maxBudgetInput);
@@ -435,7 +607,7 @@
         pullStatus.set("启动失败：最低预算不能大于最高预算");
         return;
       }
-      const districts = $selectedDistricts;
+      const districts = get(selectedDistricts);
       const payload: any = {
         districtCodes: districts,
         categoryType: selectedCategoryType || null,
@@ -455,20 +627,20 @@
 
       const result = await pullStart(payload);
       const nextJobId = result?.jobId || "";
+      suppressNextAutoLoad = true;
       currentJobId.set(nextJobId);
-      pullStatus.set(`任务已启动：${nextJobId || "未知"}`);
+      page.set(1);
+      pullStatus.set(`任务已启动：${nextJobId || "未知"}，后台拉取中，请稍后点击查询进度`);
       if (nextJobId) {
         rememberTaskStart(nextJobId);
+        updateTaskProgress(nextJobId, "后台拉取中");
+        startAutoPolling();
       }
-      await loadRecords();
-      if (nextJobId) {
-        updateTaskSnapshot(nextJobId);
-        const hasNewItems = hasNewItemsComparedToHistory(nextJobId);
-        if (!hasNewItems) {
-          pullStatus.set("无新拉取项目");
-          updateTaskProgress(nextJobId, "无新拉取项目");
-        }
-      }
+      records.set([]);
+      allRecords = [];
+      totalRecords = 0;
+      currentPageNo = 1;
+      currentPageSize = pageSize;
     } catch (error) {
       const message = String(error);
       pullStatus.set(`启动失败：${message}`);
@@ -479,42 +651,62 @@
   }
 
   async function loadRecords() {
+    const jobId = get(currentJobId);
+    const currentPage = get(page);
+    if (!jobId) {
+      records.set([]);
+      allRecords = [];
+      totalRecords = 0;
+      currentPageNo = currentPage;
+      currentPageSize = pageSize;
+      pullStatus.set(taskHistory.length > 0 ? "请选择一个任务查看其拉取结果" : "请先启动拉取任务");
+      return;
+    }
+
     isLoadingRecords = true;
     try {
-      const resp = await pullRecords($page, pageSize);
+      const resp = await pullRecords(jobId, currentPage, pageSize);
       allRecords = resp?.records || [];
       totalRecords = resp?.total || 0;
-      currentPageNo = resp?.page || $page;
+      currentPageNo = resp?.page || currentPage;
       currentPageSize = resp?.pageSize || pageSize;
       records.set(allRecords);
-      pullStatus.set(`已加载第 ${resp?.page || $page} 页，共 ${resp?.total || 0} 条`);
+      pullStatus.set(`任务 ${jobId} 已加载第 ${resp?.page || currentPage} 页，共 ${resp?.total || 0} 条`);
 
       if (activeRuleConfig) {
         applyKeywordFilter(activeRuleConfig);
       }
-      if ($currentJobId) {
-        updateTaskSnapshot($currentJobId);
-      }
+      updateTaskSnapshot(jobId);
     } catch (error) {
       pullStatus.set(`拉取数据失败：${error}`);
       records.set([]);
       allRecords = [];
       totalRecords = 0;
-      currentPageNo = $page;
+      currentPageNo = currentPage;
       currentPageSize = pageSize;
     } finally {
       isLoadingRecords = false;
     }
   }
 
-  $: if ($page) {
-    loadRecords();
+  $: if ($page && $currentJobId) {
+    if (suppressNextAutoLoad) {
+      suppressNextAutoLoad = false;
+    } else {
+      loadRecords();
+    }
   }
 
-  async function queryProgress() {
+  async function queryProgress(triggerLoad = true) {
+    if (isPollingProgress) {
+      return;
+    }
+
+    isPollingProgress = true;
     try {
-      const jobId = $currentJobId;
+      const jobId = get(currentJobId);
       if (!jobId) {
+        stopAutoPolling();
         pullStatus.set("请先启动拉取任务");
         return;
       }
@@ -522,11 +714,36 @@
       const progressText = `状态：${result.status}；${result.processed}/${result.total}`;
       pullStatus.set(progressText);
       updateTaskProgress(jobId, progressText);
-      await loadRecords();
+
+      if (triggerLoad || result.processed > 0 || isTerminalPullStatus(result.status)) {
+        await loadRecords();
+      }
+
+      if (isTerminalPullStatus(result.status)) {
+        stopAutoPolling();
+      } else {
+        startAutoPolling();
+      }
+
       pullStatus.set(progressText);
     } catch (error) {
+      stopAutoPolling();
       pullStatus.set(`查询失败：${error}`);
+    } finally {
+      isPollingProgress = false;
     }
+  }
+
+  $: if ($currentJobId) {
+    const history = taskHistory.find((item) => item.jobId === $currentJobId);
+    const progressText = history?.progressText || "";
+    if (progressText.includes("状态：succeeded") || progressText.includes("状态：failed")) {
+      stopAutoPolling();
+    } else {
+      startAutoPolling();
+    }
+  } else {
+    stopAutoPolling();
   }
 
   function applySelectedRule() {
@@ -1341,6 +1558,38 @@
 </sl-dialog>
 
 <sl-dialog
+  class="start-pull-confirm-dialog"
+  label={startPullConfirmTitle}
+  bind:this={startPullConfirmDialog}
+  on:sl-after-hide={() => resolveStartPullConfirm(false)}
+>
+  <p>{startPullConfirmMessage}</p>
+  <div slot="footer" class="dialog-footer-actions">
+    <button type="button" on:click={() => startPullConfirmDialog?.hide()}>继续当前任务</button>
+    <button
+      type="button"
+      on:click={() => {
+        resolveStartPullConfirm(true);
+        startPullConfirmDialog?.hide();
+      }}
+    >
+      {startPullConfirmActionLabel}
+    </button>
+  </div>
+</sl-dialog>
+
+<sl-dialog
+  class="state-warning-dialog"
+  label="筛选提示"
+  bind:this={stateWarningDialog}
+>
+  <p>{stateWarningMessage}</p>
+  <div slot="footer" class="dialog-footer-actions">
+    <button type="button" on:click={() => stateWarningDialog?.hide()}>我知道了</button>
+  </div>
+</sl-dialog>
+
+<sl-dialog
   class="task-history-dialog"
   label="任务记录"
   bind:this={taskHistoryDialog}
@@ -1359,6 +1608,7 @@
             <p>进度：{item.progressText}</p>
             <p class="summary">筛选：{item.filterSummary}</p>
             <p>快照：当前页记录 {item.snapshotCount} 条（示例ID：{item.snapshotSourceIds.slice(0, 3).join(", ") || "无"}）</p>
+            <p>过期时间：{item.expiresAt ? formatDateTime(item.expiresAt) : "待任务数据加载后确定"}</p>
             <p>启动时间：{formatDateTime(item.startedAt)}；最近更新：{formatDateTime(item.updatedAt)}</p>
           </li>
         {/each}

@@ -1,5 +1,5 @@
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, COOKIE, ORIGIN, REFERER, SET_COOKIE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, SET_COOKIE};
 use reqwest::blocking::multipart::{Form, Part};
 use serde::Deserialize;
 use shared::{AppError, ErrorCode};
@@ -96,10 +96,48 @@ impl JxemallLoginHttpClient {
             .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
             .collect();
 
-        let body: LoginBody = response.json().map_err(|err| {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body_text = response.text().map_err(|err| {
             AppError::new(
                 ErrorCode::Infrastructure,
-                format!("failed to parse login response json: {err}"),
+                format!("failed to read login response body: {err}"),
+            )
+        })?;
+
+        if !content_type.to_ascii_lowercase().contains("json") {
+            let code = if status.as_u16() == 401 || status.as_u16() == 403 {
+                ErrorCode::Unauthorized
+            } else {
+                ErrorCode::Infrastructure
+            };
+
+            return Err(AppError::new(
+                code,
+                format!(
+                    "login response is not json (http {}, content-type {}): {}",
+                    status,
+                    if content_type.is_empty() { "<empty>" } else { content_type.as_str() },
+                    body_preview(&body_text)
+                ),
+            ));
+        }
+
+        let body: LoginBody = serde_json::from_str(&body_text).map_err(|err| {
+            AppError::new(
+                ErrorCode::Infrastructure,
+                format!(
+                    "failed to parse login response json (http {}, content-type {}): {}; body={}",
+                    status,
+                    if content_type.is_empty() { "<empty>" } else { content_type.as_str() },
+                    err,
+                    body_preview(&body_text)
+                ),
             )
         })?;
 
@@ -132,6 +170,26 @@ impl JxemallLoginHttpClient {
             set_cookie_headers,
             sso_session,
         })
+    }
+}
+
+fn body_preview(s: &str) -> String {
+    let compact = s
+        .chars()
+        .map(|ch| if ch.is_control() && ch != '\n' && ch != '\t' { ' ' } else { ch })
+        .collect::<String>()
+        .replace('\n', " ")
+        .replace('\t', " ");
+
+    let mut out = compact.trim().to_string();
+    if out.chars().count() > 180 {
+        out = out.chars().take(180).collect::<String>();
+        out.push_str("...");
+    }
+    if out.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        out
     }
 }
 

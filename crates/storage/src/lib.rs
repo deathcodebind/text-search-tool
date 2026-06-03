@@ -8,6 +8,7 @@ const TERM_SEPARATOR: &str = "\u{1f}";
 
 pub trait StorageRepository {
     fn upsert_records(&self, records: &[Record]) -> Result<u64, AppError>;
+    fn associate_job_records(&self, job_id: &str, source_ids: &[String]) -> Result<(), AppError>;
     fn list_records(&self) -> Result<Vec<Record>, AppError>;
     fn mark_job_status(
         &self,
@@ -94,6 +95,18 @@ impl SqliteStorageRepository {
                 message TEXT,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS crawl_job_records (
+                job_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (job_id, source_id),
+                FOREIGN KEY(job_id) REFERENCES crawl_jobs(job_id) ON DELETE CASCADE,
+                FOREIGN KEY(source_id) REFERENCES records(source_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_crawl_job_records_job_id
+            ON crawl_job_records(job_id, created_at DESC, source_id ASC);
 
             CREATE TABLE IF NOT EXISTS keyword_rules (
                 rule_id TEXT PRIMARY KEY,
@@ -187,6 +200,48 @@ impl SqliteStorageRepository {
         });
 
         Ok(mapped)
+    }
+
+    pub fn get_job_message(&self, job_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().map_err(|_| {
+            AppError::new(ErrorCode::Infrastructure, "failed to acquire sqlite lock")
+        })?;
+
+        conn
+            .query_row(
+                "SELECT message FROM crawl_jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to query job message: {err}"),
+                )
+            })
+    }
+
+    pub fn count_job_records(&self, job_id: &str) -> Result<u64, AppError> {
+        let conn = self.conn.lock().map_err(|_| {
+            AppError::new(ErrorCode::Infrastructure, "failed to acquire sqlite lock")
+        })?;
+
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM crawl_job_records WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to count job records: {err}"),
+                )
+            })?;
+
+        Ok(cnt as u64)
     }
 
     pub fn count_records(&self) -> Result<u64, AppError> {
@@ -444,6 +499,82 @@ impl SqliteStorageRepository {
                 AppError::new(
                     ErrorCode::Infrastructure,
                     format!("failed to map record document row: {err}"),
+                )
+            })?);
+        }
+
+        Ok(docs)
+    }
+
+    pub fn list_record_documents_by_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<StoredRecordDocument>, AppError> {
+        let conn = self.conn.lock().map_err(|_| {
+            AppError::new(ErrorCode::Infrastructure, "failed to acquire sqlite lock")
+        })?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT
+                    r.source_id,
+                    r.source_url,
+                    r.title,
+                    r.region_code,
+                    r.published_at,
+                    r.expires_at,
+                    d.detail_text,
+                    j.status,
+                    j.message,
+                    j.attempts,
+                    j.updated_at
+                FROM crawl_job_records cjr
+                INNER JOIN records r ON r.source_id = cjr.source_id
+                LEFT JOIN record_details d ON d.source_id = r.source_id
+                LEFT JOIN record_detail_jobs j ON j.source_id = r.source_id
+                WHERE cjr.job_id = ?1
+                ORDER BY r.published_at DESC, r.source_id ASC
+                "#,
+            )
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to prepare job scoped document list query: {err}"),
+                )
+            })?;
+
+        let rows = stmt
+            .query_map(params![job_id], |row| {
+                Ok(StoredRecordDocument {
+                    record: Record {
+                        source_id: row.get(0)?,
+                        source_url: row.get(1)?,
+                        title: row.get(2)?,
+                        region_code: row.get(3)?,
+                        published_at: row.get(4)?,
+                        expires_at: row.get(5)?,
+                    },
+                    detail_text: row.get(6)?,
+                    detail_status: row.get(7)?,
+                    detail_message: row.get(8)?,
+                    detail_attempts: row.get::<_, Option<i64>>(9)?.unwrap_or(0) as u32,
+                    detail_updated_at: row.get(10)?,
+                })
+            })
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to query job scoped record documents: {err}"),
+                )
+            })?;
+
+        let mut docs = Vec::new();
+        for row in rows {
+            docs.push(row.map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!("failed to map job scoped record document row: {err}"),
                 )
             })?);
         }
@@ -721,6 +852,48 @@ impl StorageRepository for SqliteStorageRepository {
         })?;
 
         Ok(records.len() as u64)
+    }
+
+    fn associate_job_records(&self, job_id: &str, source_ids: &[String]) -> Result<(), AppError> {
+        let mut conn = self.conn.lock().map_err(|_| {
+            AppError::new(ErrorCode::Infrastructure, "failed to acquire sqlite lock")
+        })?;
+
+        let tx = conn.transaction().map_err(|err| {
+            AppError::new(
+                ErrorCode::Infrastructure,
+                format!("failed to start sqlite transaction: {err}"),
+            )
+        })?;
+
+        for source_id in source_ids {
+            tx.execute(
+                r#"
+                INSERT INTO crawl_job_records (job_id, source_id, created_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(job_id, source_id) DO NOTHING
+                "#,
+                params![job_id, source_id, Self::now_ts()],
+            )
+            .map_err(|err| {
+                AppError::new(
+                    ErrorCode::Infrastructure,
+                    format!(
+                        "failed to associate record {} with job {}: {err}",
+                        source_id, job_id
+                    ),
+                )
+            })?;
+        }
+
+        tx.commit().map_err(|err| {
+            AppError::new(
+                ErrorCode::Infrastructure,
+                format!("failed to commit sqlite transaction: {err}"),
+            )
+        })?;
+
+        Ok(())
     }
 
     fn list_records(&self) -> Result<Vec<Record>, AppError> {
