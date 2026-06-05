@@ -117,6 +117,17 @@ struct PullRecordDetailResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PullRecordStatusResponse {
+  source_id: String,
+  status: String,
+  message: String,
+  attempts: u32,
+  updated_at: Option<i64>,
+  has_detail: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FetchDetailPageHtmlResponse {
   source_page_url: String,
   html: String,
@@ -375,6 +386,28 @@ fn build_detail_target_from_source_url(source_id: String, source_url: &str) -> O
     requisition_id,
     announcement_type,
   })
+}
+
+fn normalize_source_page_url(raw_url: &str) -> String {
+  let trimmed = raw_url.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+
+  if !trimmed.contains("/api/sparta/announcement/detail") {
+    return trimmed.to_string();
+  }
+
+  let requisition_id = match extract_query_value(trimmed, "requisitionId") {
+    Some(value) if !value.trim().is_empty() => value,
+    _ => return trimmed.to_string(),
+  };
+  let announcement_type = extract_query_value(trimmed, "type")
+    .unwrap_or_else(|| "BIDDING_INVITATION".to_string());
+
+  crawler::JXEMALL_DETAIL_REFERER_TEMPLATE
+    .replace("{requisitionId}", requisition_id.trim())
+    .replace("{type}", announcement_type.trim())
 }
 
 fn extract_session_cookie_from_credential_ref(credential_ref: &str) -> Option<String> {
@@ -1329,7 +1362,7 @@ fn pull_records(input: Option<PullRecordsQuery>) -> Result<PullRecordsResponse, 
 
       PullRecordItem {
         source_id: x.record.source_id,
-        source_url: x.record.source_url,
+        source_url: normalize_source_page_url(&x.record.source_url),
         title: x.record.title,
         region_code: x.record.region_code,
         published_at: x.record.published_at,
@@ -1370,8 +1403,55 @@ fn pull_record_detail(source_id: String) -> Result<PullRecordDetailResponse, Str
     title,
     detail_text: payload.detail_text,
     raw_json: payload.raw_json,
-    source_page_url: payload.source_page_url,
+    source_page_url: normalize_source_page_url(&payload.source_page_url),
     attachment_urls: payload.attachment_urls,
+  })
+}
+
+#[tauri::command]
+fn pull_record_status(source_id: String) -> Result<PullRecordStatusResponse, String> {
+  let repo = SqliteStorageRepository::open(db_path()?).map_err(|e| e.message)?;
+  let docs = repo.list_record_documents().map_err(|e| e.message)?;
+  let doc = docs
+    .into_iter()
+    .find(|x| x.record.source_id == source_id)
+    .ok_or_else(|| "record not found".to_string())?;
+
+  let now_secs = now_unix_secs()?;
+  let mut status = doc.detail_status.unwrap_or_else(|| "queued".to_string());
+  let mut message = doc.detail_message.unwrap_or_default();
+
+  if (status == "queued" || status == "running")
+    && doc
+      .detail_updated_at
+      .map(|updated| now_secs.saturating_sub(updated) > DETAIL_JOB_STALLED_SECONDS)
+      .unwrap_or(false)
+  {
+    let stale_from = status.clone();
+    status = "timeout".to_string();
+    message = if message.trim().is_empty() {
+      format!(
+        "detail sync stalled in {stale_from} for over {DETAIL_JOB_STALLED_SECONDS}s, please retry"
+      )
+    } else {
+      format!(
+        "detail sync stalled in {stale_from} for over {DETAIL_JOB_STALLED_SECONDS}s, please retry; last message: {}",
+        message
+      )
+    };
+  }
+
+  Ok(PullRecordStatusResponse {
+    source_id: doc.record.source_id,
+    status,
+    message,
+    attempts: doc.detail_attempts.saturating_sub(1),
+    updated_at: doc.detail_updated_at,
+    has_detail: doc
+      .detail_text
+      .as_ref()
+      .map(|t| !t.trim().is_empty())
+      .unwrap_or(false),
   })
 }
 
@@ -1382,13 +1462,14 @@ fn fetch_detail_page_html(source_id: String) -> Result<FetchDetailPageHtmlRespon
     .get_record_detail_payload(&source_id)
     .map_err(|e| e.message)?;
   let source_page_url = if let Some(payload) = detail_payload {
-    payload.source_page_url
+    normalize_source_page_url(&payload.source_page_url)
   } else {
-    repo
+    let raw_url = repo
       .get_record_by_source_id(&source_id)
       .map_err(|e| e.message)?
       .map(|x| x.source_url)
-      .ok_or_else(|| "record not found".to_string())?
+      .ok_or_else(|| "record not found".to_string())?;
+    normalize_source_page_url(&raw_url)
   };
   if source_page_url.trim().is_empty() {
     return Err("source page url is not available".to_string());
@@ -1718,6 +1799,7 @@ pub fn run() {
       pull_cancel,
       pull_progress,
       pull_records,
+      pull_record_status,
       pull_record_detail,
       fetch_detail_page_html,
       download_attachment,

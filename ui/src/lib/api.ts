@@ -46,6 +46,10 @@ export function pullRecordDetail(sourceId: string) {
   return invoke("pull_record_detail", { sourceId });
 }
 
+export function pullRecordStatus(sourceId: string) {
+  return invoke("pull_record_status", { sourceId });
+}
+
 export function fetchDetailPageHtml(sourceId: string) {
   return invoke("fetch_detail_page_html", { sourceId });
 }

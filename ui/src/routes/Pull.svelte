@@ -595,6 +595,18 @@
 
   async function startPull() {
     try {
+      if (quickState !== "bidding") {
+        const proceedNonBidding = await openStartPullConfirmDialog(
+          "非竞价中状态提醒",
+          "当前筛选不是“竞价中”。不推荐拉取非竞价中的数据。是否继续按当前状态发起拉取？",
+          "继续拉取"
+        );
+        if (!proceedNonBidding) {
+          pullStatus.set("已取消本次拉取，请切回“竞价中”后再启动");
+          return;
+        }
+      }
+
       const shouldStart = await guardBeforeStartPull();
       if (!shouldStart) {
         return;

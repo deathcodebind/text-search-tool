@@ -352,11 +352,6 @@ impl JxemallListNewestHttpClient {
         Ok(items
             .into_iter()
             .map(|item| {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-
                 let requisition_id = item
                     .requisition_id
                     .clone()
@@ -365,14 +360,9 @@ impl JxemallListNewestHttpClient {
                     .announcement_type
                     .unwrap_or_else(|| "BIDDING_INVITATION".to_string());
 
-                let source_url = format!(
-                    "{base}{path}?requisitionId={}&type={}&timestamp={}",
-                    requisition_id,
-                    announcement_type,
-                    now_ms,
-                    base = self.base_url.trim_end_matches('/'),
-                    path = JXEMALL_DETAIL_PATH,
-                );
+                let source_url = JXEMALL_DETAIL_REFERER_TEMPLATE
+                    .replace("{requisitionId}", &requisition_id)
+                    .replace("{type}", &announcement_type);
 
                 JxemallAnnouncementSummary {
                     record: Record {

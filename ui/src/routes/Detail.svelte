@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { downloadAttachment, fetchDetailPageHtml, openExternalUrl, pullRecordDetail } from "../lib/api";
+  import { downloadAttachment, fetchDetailPageHtml, openExternalUrl, pullRecordDetail, pullRecordStatus, pullRetryDetail } from "../lib/api";
   import { params as routeParams } from "svelte-spa-router";
 
   export let params: { sourceId?: string } | null | undefined = undefined;
@@ -13,6 +13,40 @@
   let openingExternal = false;
   let attachmentStatus = "";
   let downloadingUrl = "";
+  let detailLoading = false;
+
+  async function wait(ms: number) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function pollDetailAfterRetry(maxAttempts = 40) {
+    for (let i = 0; i < maxAttempts; i += 1) {
+      await wait(1200);
+      try {
+        const state: any = await pullRecordStatus(sourceId);
+        const stateText = String(state?.status || "").toLowerCase();
+        const attempts = Number(state?.attempts || 0);
+
+        if (state?.hasDetail || stateText === "succeeded") {
+          const nextDetail = await pullRecordDetail(sourceId);
+          detail = nextDetail;
+          status = "详情已加载";
+          return true;
+        }
+
+        if (stateText === "failed" || stateText === "timeout" || stateText === "canceled") {
+          status = `详情补拉失败：${state?.message || stateText}`;
+          return false;
+        }
+
+        const progressHint = attempts > 0 ? `（重试 ${attempts} 次）` : "";
+        status = `详情补拉中：${state?.status || "queued"}${progressHint}`;
+      } catch {
+        // keep polling on transient errors
+      }
+    }
+    return false;
+  }
 
   function attachmentNameFromUrl(url: string, index: number) {
     try {
@@ -89,6 +123,7 @@
       status = "未指定 sourceId";
       return;
     }
+    detailLoading = true;
     try {
       detail = await pullRecordDetail(sourceId);
       status = "详情已加载";
@@ -98,8 +133,22 @@
         window.location.hash = "#/login";
         return;
       }
-      status = `详情未入库，可直接打开系统浏览器查看：${message}`;
+      if (message.includes("detail not found")) {
+        status = "详情未入库，正在尝试补拉详情内容...";
+        try {
+          await pullRetryDetail(sourceId);
+          const loaded = await pollDetailAfterRetry();
+          if (!loaded) {
+            status = "详情补拉仍在进行中，请稍后重试；可先在系统浏览器查看原页面。";
+          }
+        } catch (retryError) {
+          status = `详情补拉失败：${retryError}`;
+        }
+      } else {
+        status = `详情未入库，可直接打开系统浏览器查看：${message}`;
+      }
     } finally {
+      detailLoading = false;
       if (detail?.sourcePageUrl) {
         embeddedSourceUrl = detail.sourcePageUrl;
       } else {
@@ -174,6 +223,9 @@
 <h2>详情页</h2>
 <button class="fixed-back" on:click={() => (window.location.hash = "#/pull")}>← 返回拉取页</button>
 <p>{status}</p>
+{#if detailLoading}
+  <p class="hint">详情补拉中，请稍候...</p>
+{/if}
 {#if detail}
   <div class="detail-card">
     <p><strong>记录 ID:</strong> {detail.sourceId}</p>
