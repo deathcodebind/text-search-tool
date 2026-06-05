@@ -146,6 +146,7 @@ struct DownloadAttachmentResponse {
 #[serde(rename_all = "camelCase")]
 struct OpenExternalUrlResponse {
   opened: bool,
+  opened_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1607,8 +1608,10 @@ fn open_external_url(url: String) -> Result<OpenExternalUrlResponse, String> {
 
   #[cfg(target_os = "windows")]
   let mut cmd = {
+    let escaped = trimmed.replace('"', "\"\"");
+    let quoted = format!("\"{escaped}\"");
     let mut c = Command::new("cmd");
-    c.args(["/C", "start", "", trimmed]);
+    c.args(["/C", "start", "", quoted.as_str()]);
     c
   };
 
@@ -1620,7 +1623,10 @@ fn open_external_url(url: String) -> Result<OpenExternalUrlResponse, String> {
     return Err(format!("failed to open external url, exit status: {status}"));
   }
 
-  Ok(OpenExternalUrlResponse { opened: true })
+  Ok(OpenExternalUrlResponse {
+    opened: true,
+    opened_url: trimmed.to_string(),
+  })
 }
 
 #[tauri::command]

@@ -96,8 +96,9 @@
     embeddedSourceUrl = finalUrl;
     openingExternal = true;
     try {
-      await openExternalUrl(finalUrl);
-      status = "已调用系统浏览器打开原页面，请在浏览器完成登录后查看。";
+      const result: any = await openExternalUrl(finalUrl);
+      const openedUrl = (result?.openedUrl || finalUrl || "").trim();
+      status = `已调用系统浏览器打开：${openedUrl}`;
     } catch (error) {
       status = `打开系统浏览器失败：${error}`;
     } finally {
