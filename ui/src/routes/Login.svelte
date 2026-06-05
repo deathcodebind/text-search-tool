@@ -1,7 +1,7 @@
 <script lang="ts">
   import { loginStore } from "../lib/stores";
   import { loginSubmit } from "../lib/api";
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy } from "svelte";
 
   const SITE_OPTIONS = [
     {
@@ -34,12 +34,6 @@
     username = value.username;
     remember = value.remember;
     loginState = value;
-  });
-
-  onMount(() => {
-    if (loginState.username) {
-      window.location.hash = "#/pull";
-    }
   });
 
   async function submit() {

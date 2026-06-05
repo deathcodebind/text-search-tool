@@ -221,6 +221,10 @@
     }
 
     stopAutoPolling();
+    loginStore.update((value) => ({
+      ...value,
+      username: "",
+    }));
     pullStatus.set("登录状态已失效，正在跳转登录页...");
     window.location.hash = "#/login";
     return true;
