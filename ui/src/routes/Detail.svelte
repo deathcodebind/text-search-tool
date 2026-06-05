@@ -14,21 +14,49 @@
   let attachmentStatus = "";
   let downloadingUrl = "";
   let detailLoading = false;
+  let resolvedSourceUrl = "";
 
   function ensureDetailTypeForBrowser(url: string) {
     const trimmed = (url || "").trim();
     if (!trimmed) {
       return "";
     }
-    const hasRequisitionId = /[?&]requisitionId=/i.test(trimmed);
-    const hasType = /[?&]type=/i.test(trimmed);
-    if (!hasRequisitionId || hasType) {
-      return trimmed;
+
+    try {
+      const parsed = new URL(trimmed);
+      const requisitionId = (parsed.searchParams.get("requisitionId") || "").trim();
+      if (!requisitionId) {
+        return trimmed;
+      }
+
+      const type = (parsed.searchParams.get("type") || "BIDDING_INVITATION").trim() || "BIDDING_INVITATION";
+      const rebuilt = new URL(`${parsed.origin}${parsed.pathname}`);
+
+      // Put `type` first so it is never the trailing parameter.
+      rebuilt.searchParams.set("type", type);
+      rebuilt.searchParams.set("requisitionId", requisitionId);
+
+      for (const [key, value] of parsed.searchParams.entries()) {
+        if (key === "type" || key === "requisitionId") {
+          continue;
+        }
+        rebuilt.searchParams.append(key, value);
+      }
+
+      rebuilt.hash = parsed.hash;
+      return rebuilt.toString();
+    } catch {
+      // Fallback for non-standard URLs: at least ensure type exists.
+      const hasRequisitionId = /[?&]requisitionId=/i.test(trimmed);
+      const hasType = /[?&]type=/i.test(trimmed);
+      if (!hasRequisitionId || hasType) {
+        return trimmed;
+      }
+      const [base, fragment] = trimmed.split("#", 2);
+      const separator = base.includes("?") ? "&" : "?";
+      const next = `${base}${separator}type=BIDDING_INVITATION`;
+      return fragment ? `${next}#${fragment}` : next;
     }
-    const [base, fragment] = trimmed.split("#", 2);
-    const separator = base.includes("?") ? "&" : "?";
-    const next = `${base}${separator}type=BIDDING_INVITATION`;
-    return fragment ? `${next}#${fragment}` : next;
   }
 
   async function wait(ms: number) {
@@ -101,10 +129,10 @@
   }
 
   async function openInSystemBrowser() {
-    if (!embeddedSourceUrl) {
+    if (!resolvedSourceUrl && !embeddedSourceUrl) {
       await loadSourcePageUrl();
     }
-    const finalUrl = ensureDetailTypeForBrowser(embeddedSourceUrl);
+    const finalUrl = ensureDetailTypeForBrowser(detail?.sourcePageUrl || embeddedSourceUrl);
     if (!finalUrl) {
       return;
     }
@@ -178,6 +206,8 @@
   $: if (sourceId) {
     loadDetail();
   }
+
+  $: resolvedSourceUrl = ensureDetailTypeForBrowser(detail?.sourcePageUrl || embeddedSourceUrl);
 </script>
 
 <style>
@@ -250,8 +280,8 @@
     <p><strong>标题:</strong> {detail.title || "（无标题）"}</p>
     <p>
       <strong>源页面:</strong>
-      {#if detail.sourcePageUrl}
-        <a href={ensureDetailTypeForBrowser(detail.sourcePageUrl)} target="_blank" rel="noreferrer">{ensureDetailTypeForBrowser(detail.sourcePageUrl)}</a>
+      {#if resolvedSourceUrl}
+        <a href={resolvedSourceUrl} target="_blank" rel="noreferrer">{resolvedSourceUrl}</a>
       {:else}
         （无）
       {/if}
@@ -287,8 +317,8 @@
 
 <div class="detail-card embedded-section">
   <p><strong>原页面访问</strong></p>
-  {#if embeddedSourceUrl}
-    <p class="hint">源地址：<a href={ensureDetailTypeForBrowser(embeddedSourceUrl)} target="_blank" rel="noreferrer">{ensureDetailTypeForBrowser(embeddedSourceUrl)}</a></p>
+  {#if resolvedSourceUrl}
+    <p class="hint">源地址：<a href={resolvedSourceUrl} target="_blank" rel="noreferrer">{resolvedSourceUrl}</a></p>
   {/if}
   <p class="hint">提示：该站点禁止被内嵌显示，请使用系统浏览器访问并手动登录。</p>
   <button type="button" disabled={openingExternal || sourceUrlLoading} on:click={openInSystemBrowser}>
