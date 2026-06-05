@@ -786,6 +786,30 @@ fn load_login_session_state() -> Result<Option<LoginSessionState>, String> {
   Ok(None)
 }
 
+fn clear_login_session_state() -> Result<(), String> {
+  {
+    let mut cookie_guard = LOGIN_SESSION_COOKIE
+      .lock()
+      .map_err(|_| "failed to lock login session state".to_string())?;
+    *cookie_guard = None;
+  }
+
+  {
+    let mut base_guard = LOGIN_BASE_URL
+      .lock()
+      .map_err(|_| "failed to lock login base url state".to_string())?;
+    *base_guard = None;
+  }
+
+  let path = session_state_path()?;
+  if path.exists() {
+    std::fs::remove_file(&path)
+      .map_err(|e| format!("failed to clear login session state: {e}"))?;
+  }
+
+  Ok(())
+}
+
 fn now_unix_secs() -> Result<i64, String> {
   Ok(
     SystemTime::now()
@@ -1608,25 +1632,24 @@ fn open_external_url(url: String) -> Result<OpenExternalUrlResponse, String> {
 
   #[cfg(target_os = "windows")]
   let mut cmd = {
-    let escaped = trimmed.replace('"', "\"\"");
-    let quoted = format!("\"{escaped}\"");
-    let mut c = Command::new("cmd");
-    c.args(["/C", "start", "", quoted.as_str()]);
+    let mut c = Command::new("explorer");
+    c.arg(trimmed);
     c
   };
 
-  let status = cmd
-    .status()
+  cmd
+    .spawn()
     .map_err(|e| format!("failed to open external url: {e}"))?;
-
-  if !status.success() {
-    return Err(format!("failed to open external url, exit status: {status}"));
-  }
 
   Ok(OpenExternalUrlResponse {
     opened: true,
     opened_url: trimmed.to_string(),
   })
+}
+
+#[tauri::command]
+fn clear_login_session() -> Result<(), String> {
+  clear_login_session_state()
 }
 
 #[tauri::command]
@@ -1835,6 +1858,7 @@ pub fn run() {
       fetch_detail_page_html,
       download_attachment,
       open_external_url,
+      clear_login_session,
       pull_retry_detail,
       preview_bool_query,
       preview_keyword_groups

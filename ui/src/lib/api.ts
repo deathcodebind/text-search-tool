@@ -65,3 +65,7 @@ export function downloadAttachment(sourceId: string, url: string) {
 export function openExternalUrl(url: string) {
   return invoke("open_external_url", { url });
 }
+
+export function clearLoginSession() {
+  return invoke("clear_login_session");
+}
