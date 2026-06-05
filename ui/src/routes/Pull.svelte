@@ -206,6 +206,26 @@
     return normalized === "succeeded" || normalized === "failed" || normalized === "canceled";
   }
 
+  function isSessionExpiredError(message: string) {
+    const text = (message || "").toLowerCase();
+    return message.includes("缺少会话 cookie")
+      || message.includes("请先登录")
+      || message.includes("登录已过期")
+      || text.includes("unauthorized")
+      || text.includes("401");
+  }
+
+  function redirectToLoginIfSessionExpired(message: string) {
+    if (!isSessionExpiredError(message)) {
+      return false;
+    }
+
+    stopAutoPolling();
+    pullStatus.set("登录状态已失效，正在跳转登录页...");
+    window.location.hash = "#/login";
+    return true;
+  }
+
   function stopAutoPolling() {
     if (pullProgressPollTimer) {
       clearInterval(pullProgressPollTimer);
@@ -553,7 +573,11 @@
       if (isTerminalPullStatus(progress.status)) {
         return true;
       }
-    } catch {
+    } catch (error) {
+      const message = String(error);
+      if (redirectToLoginIfSessionExpired(message)) {
+        return false;
+      }
       if (!isTaskStillRunning(runningEntry)) {
         return true;
       }
@@ -655,10 +679,10 @@
       currentPageSize = pageSize;
     } catch (error) {
       const message = String(error);
-      pullStatus.set(`启动失败：${message}`);
-      if (message.includes("缺少会话 cookie")) {
-        window.location.hash = "#/login";
+      if (redirectToLoginIfSessionExpired(message)) {
+        return;
       }
+      pullStatus.set(`启动失败：${message}`);
     }
   }
 
@@ -690,7 +714,11 @@
       }
       updateTaskSnapshot(jobId);
     } catch (error) {
-      pullStatus.set(`拉取数据失败：${error}`);
+      const message = String(error);
+      if (redirectToLoginIfSessionExpired(message)) {
+        return;
+      }
+      pullStatus.set(`拉取数据失败：${message}`);
       records.set([]);
       allRecords = [];
       totalRecords = 0;
@@ -739,8 +767,12 @@
 
       pullStatus.set(progressText);
     } catch (error) {
+      const message = String(error);
+      if (redirectToLoginIfSessionExpired(message)) {
+        return;
+      }
       stopAutoPolling();
-      pullStatus.set(`查询失败：${error}`);
+      pullStatus.set(`查询失败：${message}`);
     } finally {
       isPollingProgress = false;
     }
