@@ -388,6 +388,28 @@ fn build_detail_target_from_source_url(source_id: String, source_url: &str) -> O
   })
 }
 
+fn ensure_detail_type_query(raw_url: &str) -> String {
+  if extract_query_value(raw_url, "type")
+    .map(|value| !value.trim().is_empty())
+    .unwrap_or(false)
+  {
+    return raw_url.to_string();
+  }
+
+  let (base, fragment) = match raw_url.split_once('#') {
+    Some((left, right)) => (left, Some(right)),
+    None => (raw_url, None),
+  };
+
+  let separator = if base.contains('?') { '&' } else { '?' };
+  let mut merged = format!("{base}{separator}type=BIDDING_INVITATION");
+  if let Some(fragment_value) = fragment {
+    merged.push('#');
+    merged.push_str(fragment_value);
+  }
+  merged
+}
+
 fn normalize_source_page_url(raw_url: &str) -> String {
   let trimmed = raw_url.trim();
   if trimmed.is_empty() {
@@ -395,6 +417,9 @@ fn normalize_source_page_url(raw_url: &str) -> String {
   }
 
   if !trimmed.contains("/api/sparta/announcement/detail") {
+    if trimmed.contains("/luban/bidding/detail") {
+      return ensure_detail_type_query(trimmed);
+    }
     return trimmed.to_string();
   }
 
