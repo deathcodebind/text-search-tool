@@ -16,49 +16,6 @@
   let detailLoading = false;
   let resolvedSourceUrl = "";
 
-  function ensureDetailTypeForBrowser(url: string) {
-    const trimmed = (url || "").trim();
-    if (!trimmed) {
-      return "";
-    }
-
-    try {
-      const parsed = new URL(trimmed);
-      const requisitionId = (parsed.searchParams.get("requisitionId") || "").trim();
-      if (!requisitionId) {
-        return trimmed;
-      }
-
-      const type = (parsed.searchParams.get("type") || "BIDDING_INVITATION").trim() || "BIDDING_INVITATION";
-      const rebuilt = new URL(`${parsed.origin}${parsed.pathname}`);
-
-      // Put `type` first so it is never the trailing parameter.
-      rebuilt.searchParams.set("type", type);
-      rebuilt.searchParams.set("requisitionId", requisitionId);
-
-      for (const [key, value] of parsed.searchParams.entries()) {
-        if (key === "type" || key === "requisitionId") {
-          continue;
-        }
-        rebuilt.searchParams.append(key, value);
-      }
-
-      rebuilt.hash = parsed.hash;
-      return rebuilt.toString();
-    } catch {
-      // Fallback for non-standard URLs: at least ensure type exists.
-      const hasRequisitionId = /[?&]requisitionId=/i.test(trimmed);
-      const hasType = /[?&]type=/i.test(trimmed);
-      if (!hasRequisitionId || hasType) {
-        return trimmed;
-      }
-      const [base, fragment] = trimmed.split("#", 2);
-      const separator = base.includes("?") ? "&" : "?";
-      const next = `${base}${separator}type=BIDDING_INVITATION`;
-      return fragment ? `${next}#${fragment}` : next;
-    }
-  }
-
   async function wait(ms: number) {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -129,10 +86,10 @@
   }
 
   async function openInSystemBrowser() {
-    if (!resolvedSourceUrl && !embeddedSourceUrl) {
+    if (!detail?.sourcePageUrl && !embeddedSourceUrl) {
       await loadSourcePageUrl();
     }
-    const finalUrl = ensureDetailTypeForBrowser(detail?.sourcePageUrl || embeddedSourceUrl);
+    const finalUrl = (detail?.sourcePageUrl || embeddedSourceUrl || "").trim();
     if (!finalUrl) {
       return;
     }
@@ -207,7 +164,7 @@
     loadDetail();
   }
 
-  $: resolvedSourceUrl = ensureDetailTypeForBrowser(detail?.sourcePageUrl || embeddedSourceUrl);
+  $: resolvedSourceUrl = (detail?.sourcePageUrl || embeddedSourceUrl || "").trim();
 </script>
 
 <style>
