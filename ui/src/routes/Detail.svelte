@@ -15,6 +15,22 @@
   let downloadingUrl = "";
   let detailLoading = false;
 
+  function ensureDetailTypeForBrowser(url: string) {
+    const trimmed = (url || "").trim();
+    if (!trimmed) {
+      return "";
+    }
+    const hasRequisitionId = /[?&]requisitionId=/i.test(trimmed);
+    const hasType = /[?&]type=/i.test(trimmed);
+    if (!hasRequisitionId || hasType) {
+      return trimmed;
+    }
+    const [base, fragment] = trimmed.split("#", 2);
+    const separator = base.includes("?") ? "&" : "?";
+    const next = `${base}${separator}type=BIDDING_INVITATION`;
+    return fragment ? `${next}#${fragment}` : next;
+  }
+
   async function wait(ms: number) {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -88,12 +104,14 @@
     if (!embeddedSourceUrl) {
       await loadSourcePageUrl();
     }
-    if (!embeddedSourceUrl) {
+    const finalUrl = ensureDetailTypeForBrowser(embeddedSourceUrl);
+    if (!finalUrl) {
       return;
     }
+    embeddedSourceUrl = finalUrl;
     openingExternal = true;
     try {
-      await openExternalUrl(embeddedSourceUrl);
+      await openExternalUrl(finalUrl);
       status = "已调用系统浏览器打开原页面，请在浏览器完成登录后查看。";
     } catch (error) {
       status = `打开系统浏览器失败：${error}`;
@@ -233,7 +251,7 @@
     <p>
       <strong>源页面:</strong>
       {#if detail.sourcePageUrl}
-        <a href={detail.sourcePageUrl} target="_blank" rel="noreferrer">{detail.sourcePageUrl}</a>
+        <a href={ensureDetailTypeForBrowser(detail.sourcePageUrl)} target="_blank" rel="noreferrer">{ensureDetailTypeForBrowser(detail.sourcePageUrl)}</a>
       {:else}
         （无）
       {/if}
@@ -270,7 +288,7 @@
 <div class="detail-card embedded-section">
   <p><strong>原页面访问</strong></p>
   {#if embeddedSourceUrl}
-    <p class="hint">源地址：<a href={embeddedSourceUrl} target="_blank" rel="noreferrer">{embeddedSourceUrl}</a></p>
+    <p class="hint">源地址：<a href={ensureDetailTypeForBrowser(embeddedSourceUrl)} target="_blank" rel="noreferrer">{ensureDetailTypeForBrowser(embeddedSourceUrl)}</a></p>
   {/if}
   <p class="hint">提示：该站点禁止被内嵌显示，请使用系统浏览器访问并手动登录。</p>
   <button type="button" disabled={openingExternal || sourceUrlLoading} on:click={openInSystemBrowser}>
