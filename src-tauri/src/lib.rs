@@ -1190,6 +1190,11 @@ fn login_submit(input: LoginInput) -> Result<LoginResponse, String> {
 }
 
 #[tauri::command]
+fn has_login_session() -> bool {
+  require_login_session_cookie().is_ok()
+}
+
+#[tauri::command]
 fn pull_start(input: PullRequest) -> Result<PullStartResponse, String> {
   let session_cookie = require_login_session_cookie()?;
 
@@ -1632,8 +1637,8 @@ fn open_external_url(url: String) -> Result<OpenExternalUrlResponse, String> {
 
   #[cfg(target_os = "windows")]
   let mut cmd = {
-    let mut c = Command::new("explorer");
-    c.arg(trimmed);
+    let mut c = Command::new("rundll32");
+    c.args(["url.dll,FileProtocolHandler", trimmed]);
     c
   };
 
@@ -1849,6 +1854,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       app_snapshot,
       login_submit,
+      has_login_session,
       pull_start,
       pull_cancel,
       pull_progress,

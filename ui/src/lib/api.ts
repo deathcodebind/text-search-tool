@@ -22,6 +22,10 @@ export function loginSubmit(input: LoginInput) {
   return invoke("login_submit", { input });
 }
 
+export function hasLoginSession() {
+  return invoke("has_login_session");
+}
+
 export function pullStart(input: PullStartInput) {
   return invoke("pull_start", { input });
 }

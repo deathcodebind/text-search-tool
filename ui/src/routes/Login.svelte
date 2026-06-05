@@ -1,7 +1,7 @@
 <script lang="ts">
   import { loginStore } from "../lib/stores";
-  import { loginSubmit } from "../lib/api";
-  import { onDestroy } from "svelte";
+  import { loginSubmit, hasLoginSession } from "../lib/api";
+  import { onDestroy, onMount } from "svelte";
 
   const SITE_OPTIONS = [
     {
@@ -34,6 +34,17 @@
     username = value.username;
     remember = value.remember;
     loginState = value;
+  });
+
+  onMount(async () => {
+    try {
+      const hasSession = Boolean(await hasLoginSession());
+      if (hasSession) {
+        window.location.hash = "#/pull";
+      }
+    } catch {
+      // stay on login page when session check fails
+    }
   });
 
   async function submit() {
